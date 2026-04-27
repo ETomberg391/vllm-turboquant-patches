@@ -189,7 +189,24 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        # Persistent buffers for speculative-decode expansion.
+        # When CUDA graphs are enabled, _decode_attention runs inside the
+        # captured graph and cannot create new tensors.  We expand
+        # seq_lens/block_table in build() (outside the graph) into buffers
+        # that are updated in-place before every replay.
+        #
+        # Lazy-allocated on first build() call using the actual
+        # block_table shape from the model runner, so we never guess
+        # max_num_blocks wrong.
+        self._expanded_seq_lens: torch.Tensor | None = None
+        self._expanded_block_table: torch.Tensor | None = None
+        # Pre-compute capped maximum batch size to prevent unbounded growth.
+        max_spec = (
+            vllm_config.speculative_config.num_speculative_tokens + 1
+            if vllm_config.speculative_config else 1
+        )
+        self._max_B = vllm_config.scheduler_config.max_num_seqs * max_spec
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -212,7 +229,7 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             cam, decode_threshold=self.reorder_batch_threshold
         )
 
-        return TurboQuantMetadata(
+        metadata = TurboQuantMetadata(
             seq_lens=cam.seq_lens,
             slot_mapping=cam.slot_mapping,
             block_table=cam.block_table_tensor,
@@ -220,10 +237,78 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             num_actual_tokens=cam.num_actual_tokens,
             max_query_len=cam.max_query_len,
             max_seq_len=cam.max_seq_len,
-            is_prefill=(cam.max_query_len > 1),
+            is_prefill=(num_prefills > 0),
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
         )
+
+        # ------------------------------------------------------------------
+        # Speculative-decode expansion for CUDA-graph safety.
+        #
+        # The TQ decode kernel expects one seq_len / block_table row per
+        # query token.  With MTP n=3 a single request has 4 query tokens
+        # but only 1 row in cam.seq_lens / cam.block_table_tensor.
+        #
+        # If we expand inside _decode_attention, the new tensors are
+        # created *inside* the captured graph.  During replay vLLM updates
+        # the original tensors, but the graph still references the stale
+        # captured expanded tensors → garbage attention → "!" loops.
+        #
+        # By expanding here (outside the graph) into persistent buffers,
+        # the graph captures the kernel with these buffers.  We update the
+        # buffers in-place before every replay, so the kernel sees fresh
+        # data.
+        # ------------------------------------------------------------------
+        if num_prefills == 0 and num_decode_tokens > num_decodes:
+            B = num_decode_tokens
+            num_reqs = num_decodes
+            tokens_per_req = B // num_reqs
+            max_blocks = cam.block_table_tensor.shape[1]
+            # Cap B to pre-computed maximum to prevent unbounded growth.
+            alloc_B = min(B, self._max_B)
+
+            # Lazy-allocate persistent buffers using the ACTUAL
+            # block_table shape from the model runner.  This avoids
+            # guessing max_num_blocks wrong in __init__.
+            if (
+                self._expanded_seq_lens is None
+                or self._expanded_seq_lens.shape[0] < alloc_B
+                or self._expanded_seq_lens.dtype != cam.seq_lens.dtype
+            ):
+                self._expanded_seq_lens = torch.empty(
+                    alloc_B, dtype=cam.seq_lens.dtype, device=self.device
+                )
+            if (
+                self._expanded_block_table is None
+                or self._expanded_block_table.shape[0] < alloc_B
+                or self._expanded_block_table.shape[1] < max_blocks
+                or self._expanded_block_table.dtype != cam.block_table_tensor.dtype
+            ):
+                self._expanded_block_table = torch.empty(
+                    (alloc_B, max_blocks),
+                    dtype=cam.block_table_tensor.dtype,
+                    device=self.device,
+                )
+
+            expanded_seq_lens = self._expanded_seq_lens[:B]
+            expanded_block_table = self._expanded_block_table[:B, :max_blocks]
+
+            # When fast_build=True (CUDA graph replay), the model runner
+            # already updated the persistent buffers in-place via
+            # build_for_cudagraph_capture.  Skip the copy if buffers exist.
+            if not fast_build:
+                # Copy expanded data into the persistent buffers.
+                expanded_seq_lens.copy_(
+                    metadata.seq_lens.repeat_interleave(tokens_per_req)
+                )
+                expanded_block_table.copy_(
+                    metadata.block_table.repeat_interleave(tokens_per_req, dim=0)
+                )
+
+            metadata.seq_lens = expanded_seq_lens
+            metadata.block_table = expanded_block_table
+
+        return metadata
 
 
 class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
@@ -278,6 +363,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Fixed NUM_KV_SPLITS (grid dims must be constant for cudagraph,
         # and benchmarks show no regression vs dynamic in eager mode).
         vllm_config = get_current_vllm_config()
+        self.vllm_config = vllm_config
         self.max_num_kv_splits = (
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
@@ -340,6 +426,59 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             c_sorted, _ = c.sort()
             layer._tq_midpoints = (c_sorted[:-1] + c_sorted[1:]) / 2
             layer._tq_cached = True
+
+        # --- CUDA-graph-safe buffer prealloc ---
+        # triton_turboquant_decode_attention lazily allocates mid_o/output/lse
+        # buffers on first call. During CUDA graph capture the batch size is 1,
+        # so the buffers are sized for 1. At replay time larger batches write
+        # out of bounds and corrupt KV cache, producing infinite "!" loops.
+        # Preallocate to a safe max here so the size is constant across capture
+        # and replay.
+        max_batch = getattr(layer, "_tq_max_batch", None)
+        if max_batch is None:
+            spec = self.vllm_config.speculative_config
+            max_spec = (spec.num_speculative_tokens + 1) if spec else 1
+            max_batch = self.vllm_config.scheduler_config.max_num_seqs * max_spec
+            layer._tq_max_batch = max_batch
+        mid_o_shape = (
+            max_batch,
+            self.num_heads,
+            self.max_num_kv_splits,
+            self.head_size + 1,
+        )
+        out_shape = (max_batch, self.num_heads, self.head_size)
+        lse_shape = (max_batch, self.num_heads)
+        if (
+            getattr(layer, "_tq_mid_o_buf", None) is None
+            or layer._tq_mid_o_buf.shape != mid_o_shape
+        ):
+            layer._tq_mid_o_buf = torch.empty(
+                mid_o_shape, dtype=torch.float32, device=device
+            )
+        if (
+            getattr(layer, "_tq_output_buf", None) is None
+            or layer._tq_output_buf.shape != out_shape
+        ):
+            layer._tq_output_buf = torch.empty(
+                out_shape, dtype=torch.float16, device=device
+            )
+        if (
+            getattr(layer, "_tq_lse_buf", None) is None
+            or layer._tq_lse_buf.shape != lse_shape
+        ):
+            layer._tq_lse_buf = torch.empty(
+                lse_shape, dtype=torch.float32, device=device
+            )
+        # Pre-allocate query rotation buffer to eliminate per-call allocation
+        # of q_rot = (q_float @ PiT).contiguous() — ~512 KB/layer for MTP.
+        qrot_shape = (max_batch, self.num_heads, self.head_size)
+        if (
+            getattr(layer, "_tq_qrot_buf", None) is None
+            or layer._tq_qrot_buf.shape != qrot_shape
+        ):
+            layer._tq_qrot_buf = torch.empty(
+                qrot_shape, dtype=torch.float32, device=device
+            )
 
     def do_kv_cache_update(
         self,
@@ -460,35 +599,43 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # fast path (max_query_len == max_seq_len) triggers for
             # first-chunk prefills. Using full-batch max_seq_len breaks
             # this because decode requests inflate max_seq_len.
-            prefill_seq_lens = attn_metadata.seq_lens[num_decodes:]
-            # Use CPU-side max to avoid GPU→CPU sync from .item()
-            prefill_max_seq = max(attn_metadata.seq_lens[num_decodes:].tolist())
-            prefill_qsl = (
-                attn_metadata.query_start_loc[num_decodes:] - num_decode_tokens
-            )
-            prefill_meta = TurboQuantMetadata(
-                seq_lens=prefill_seq_lens,
-                slot_mapping=attn_metadata.slot_mapping[num_decode_tokens:N],
-                block_table=attn_metadata.block_table[num_decodes:],
-                query_start_loc=prefill_qsl,
-                num_actual_tokens=N - num_decode_tokens,
-                max_query_len=attn_metadata.max_query_len,
-                max_seq_len=prefill_max_seq,
-                is_prefill=True,
-            )
-            k = key[:N].view(N, self.num_kv_heads, self.head_size)
-            v = value[:N].view(N, self.num_kv_heads, self.head_size)
-            attn_out[num_decode_tokens:] = self._prefill_attention(
-                q[num_decode_tokens:],
-                k[num_decode_tokens:],
-                v[num_decode_tokens:],
-                kv_cache,
-                prefill_meta,
-                Pi,
-                centroids,
-                PiT,
-                layer=layer,
-            )
+            prefill_tokens = N - num_decode_tokens
+            if prefill_tokens > 0:
+                prefill_seq_lens = attn_metadata.seq_lens[num_decodes:]
+                # Use CPU-side max to avoid GPU→CPU sync from .item()
+                # [tolist_cudagraph_fix] guard during capture
+                if not torch.cuda.is_current_stream_capturing():
+                    prefill_max_seq = max(
+                        attn_metadata.seq_lens[num_decodes:].tolist()
+                    )
+                else:
+                    prefill_max_seq = 1  # dummy during graph capture
+                prefill_qsl = (
+                    attn_metadata.query_start_loc[num_decodes:] - num_decode_tokens
+                )
+                prefill_meta = TurboQuantMetadata(
+                    seq_lens=prefill_seq_lens,
+                    slot_mapping=attn_metadata.slot_mapping[num_decode_tokens:N],
+                    block_table=attn_metadata.block_table[num_decodes:],
+                    query_start_loc=prefill_qsl,
+                    num_actual_tokens=prefill_tokens,
+                    max_query_len=attn_metadata.max_query_len,
+                    max_seq_len=prefill_max_seq,
+                    is_prefill=True,
+                )
+                k = key[:N].view(N, self.num_kv_heads, self.head_size)
+                v = value[:N].view(N, self.num_kv_heads, self.head_size)
+                attn_out[num_decode_tokens:] = self._prefill_attention(
+                    q[num_decode_tokens:],
+                    k[num_decode_tokens:],
+                    v[num_decode_tokens:],
+                    kv_cache,
+                    prefill_meta,
+                    Pi,
+                    centroids,
+                    PiT,
+                    layer=layer,
+                )
 
         # Write into output buffer: attn_out is (N, Hq, D)
         # output may be 2D (N, Hq*D) or 3D (N, Hq, D)
@@ -539,6 +686,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         layer: Any = None,
     ) -> torch.Tensor:
         N, Hq, D = query.shape
+        # [tolist_cudagraph_fix] early return during capture
+        if torch.cuda.is_current_stream_capturing():
+            return torch.empty_like(query)
 
         # Fast path: use flash_attn for first-chunk prefills (all K/V in batch).
         # max_query_len == max_seq_len means no request has prior cached KV.
@@ -812,11 +962,31 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             output_buf = getattr(layer, "_tq_output_buf", None)
             lse_buf = getattr(layer, "_tq_lse_buf", None)
 
+        # Speculative decode: when supports_spec_as_decode=True, decode batches
+        # may have B > num_reqs (e.g. 1 real token + 3 speculative = 4 tokens
+        # per request). The TQ decode kernel expects one seq_len/block_table row
+        # per query token, so we expand/duplicate them.
+        #
+        # NOTE: For CUDA-graph mode the expansion is done in the metadata
+        # builder (TurboQuantMetadataBuilder.build) using persistent buffers
+        # that are updated in-place before every replay.  The fallback below
+        # only runs in eager mode or when the builder did not expand.
+        seq_lens = attn_metadata.seq_lens
+        block_table = attn_metadata.block_table
+        B = query.shape[0]
+        num_reqs = seq_lens.shape[0]
+        if B > num_reqs and seq_lens.shape[0] == num_reqs:
+            # Builder did not expand (eager mode) — expand here.
+            tokens_per_req = B // num_reqs
+            seq_lens = seq_lens.repeat_interleave(tokens_per_req)
+            block_table = block_table.repeat_interleave(tokens_per_req, dim=0)
+        # else: builder already expanded; use seq_lens/block_table as-is.
+
         result = triton_turboquant_decode_attention(
             query=query,
             kv_cache=kv_cache,
-            block_table=attn_metadata.block_table,
-            seq_lens=attn_metadata.seq_lens,
+            block_table=block_table,
+            seq_lens=seq_lens,
             Pi=Pi,
             centroids=centroids,
             scale=self.scale,

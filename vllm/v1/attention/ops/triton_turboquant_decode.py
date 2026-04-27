@@ -525,7 +525,16 @@ def triton_turboquant_decode_attention(
         q_float = query.float()
         if PiT is None:
             PiT = Pi.T.contiguous()
-        q_rot = (q_float @ PiT).contiguous()
+        # Reuse pre-allocated query rotation buffer if available.
+        qrot_buf = (
+            getattr(buf_holder, "_tq_qrot_buf", None)
+            if buf_holder is not None else None
+        )
+        if qrot_buf is not None and qrot_buf.shape[0] >= B:
+            q_rot = qrot_buf[:B, :Hq, :D]
+            q_rot.copy_(q_float @ PiT)
+        else:
+            q_rot = (q_float @ PiT).contiguous()
 
     NUM_KV_SPLITS = max_num_kv_splits
 
@@ -549,7 +558,11 @@ def triton_turboquant_decode_attention(
 
     # Stage 1: split-KV tiled attention scoring + value accumulation
     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
-    BLOCK_KV = 4
+    # Adaptive tile sizing: larger BLOCK_KV + async pipelining on Ampere/Ada
+    # improves occupancy; Hopper+ keeps conservative defaults.
+    cap = torch.cuda.get_device_capability(device)
+    BLOCK_KV = 8 if cap < (9, 0) else 4
+    num_stages = 2 if cap < (9, 0) else 1
     grid = (B, Hq, NUM_KV_SPLITS)
     _tq_decode_stage1[grid](
         q_rot,
@@ -584,7 +597,7 @@ def triton_turboquant_decode_attention(
         NORM_CORRECTION=1 if norm_correction else 0,
         FP8_E4B15=fp8_e4b15,
         num_warps=1,
-        num_stages=1,
+        num_stages=num_stages,
     )
 
     # Stage 2: Reduce across KV splits
